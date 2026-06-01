@@ -50,21 +50,40 @@ STATE_FILE = os.path.join(VAULT_PATH, ".ds004_state.json")
 SKIP_DIRS = {"concepts", "insights", "digests", "daily-digest", "weekly-digest"}
 
 
-def _load_state() -> set[str]:
-    """Load the set of previously processed note paths."""
+def _load_state() -> tuple[set[str], dict[str, dict]]:
+    """Returns (processed_notes, failed_notes)."""
     try:
         with open(STATE_FILE, "r") as f:
             data = json.load(f)
-            return set(data.get("processed_notes", []))
+            processed = set(data.get("processed_notes", []))
+            failed = data.get("failed_notes", {})
+            return processed, failed
     except (FileNotFoundError, json.JSONDecodeError):
-        return set()
+        return set(), {}
 
 
-def _save_state(processed: set[str]) -> None:
-    """Save the set of processed note paths."""
+def _save_state(processed: set[str], failed: dict[str, dict] | None = None) -> None:
+    """Save state. Preserves existing failed_notes if not provided."""
+    if failed is None:
+        _, failed = _load_state()
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     with open(STATE_FILE, "w") as f:
-        json.dump({"processed_notes": sorted(processed), "updated_at": datetime.now(timezone.utc).isoformat()}, f)
+        json.dump({
+            "processed_notes": sorted(processed),
+            "failed_notes": failed,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }, f)
+
+
+def _mark_failed(note_path: str, error_msg: str) -> None:
+    """Mark a note as failed (stops retry, but preserves option to retry later)."""
+    processed, failed = _load_state()
+    processed.add(note_path)
+    failed[note_path] = {
+        "error": error_msg,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    _save_state(processed, failed)
 
 
 def _parse_frontmatter(content: str) -> dict[str, Any]:
@@ -93,7 +112,7 @@ def _find_new_episodic_notes() -> list[str]:
 
     Returns list of relative file paths.
     """
-    processed = _load_state()
+    processed, _ = _load_state()
     new_notes: list[str] = []
 
     try:
@@ -421,7 +440,7 @@ def consolidate(note_path: str) -> bool:
         logger.info(log_msg)
         _append_log_md(log_msg)
         # Mark as processed even if skipped
-        processed = _load_state()
+        processed, _ = _load_state()
         processed.add(note_path)
         _save_state(processed)
         return False
@@ -448,6 +467,7 @@ def consolidate(note_path: str) -> bool:
     except DeepSeekError as exc:
         logger.error("DeepSeek LLM call failed: %s", exc)
         _append_log_md(f"[error] {note_path} — LLM call failed: {exc}")
+        _mark_failed(note_path, str(exc))
         return False
 
     # Step 6: Parse LLM output
@@ -492,7 +512,7 @@ def consolidate(note_path: str) -> bool:
     _append_log_md(log_line)
 
     # Mark as processed
-    processed = _load_state()
+    processed, _ = _load_state()
     processed.add(note_path)
     _save_state(processed)
 
@@ -528,7 +548,7 @@ def consolidate_all() -> dict[str, Any]:
             logger.error("Error consolidating '%s': %s", note_path, exc, exc_info=True)
             errors += 1
             # Still mark as processed to avoid infinite retries
-            processed = _load_state()
+            processed, _ = _load_state()
             processed.add(note_path)
             _save_state(processed)
 

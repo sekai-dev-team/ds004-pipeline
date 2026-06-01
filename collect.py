@@ -30,7 +30,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from pipeline.consolidator import consolidate_all, _load_state
+from pipeline.consolidator import consolidate_all, _load_state, _save_state
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,12 +56,34 @@ def main() -> None:
         default=60,
         help="Polling interval in seconds for watch mode (default: 60)",
     )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Clear failed_notes queue and re-process failed notes",
+    )
+    parser.add_argument(
+        "--reset-state",
+        action="store_true",
+        help="Wipe all processing state (start fresh)",
+    )
     args = parser.parse_args()
 
     pipeline_name = f"ds004-{args.mode}"
     timestamp = datetime.now(timezone.utc).isoformat()
 
     logger.info("Starting pipeline: %s at %s", pipeline_name, timestamp)
+
+    # Handle --reset-state: wipe all processing state
+    if args.reset_state:
+        logger.warning("--reset-state: wiping all processing state")
+        _save_state(set(), {})
+        logger.info("State file cleared — will re-process all notes")
+
+    # Handle --retry-failed: clear the failed queue so failed notes are retried
+    if args.retry_failed:
+        processed, _ = _load_state()
+        _save_state(processed, {})
+        logger.info("Cleared failed_notes queue — will retry all previously failed notes")
 
     if args.mode == "consolidate":
         _run_consolidate()
