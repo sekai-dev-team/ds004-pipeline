@@ -6,6 +6,7 @@ to search, read, write, and update notes in the vault.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -121,21 +122,34 @@ def search(query: str, limit: int = 10) -> list[dict[str, Any]]:
     if result is None:
         return []
 
-    # Handle different possible response shapes
-    results = result.get("content", result) if isinstance(result, dict) else result
-    if isinstance(results, list):
-        # Already a list of results
-        pass
-    elif isinstance(results, dict) and isinstance(results.get("results"), list):
-        results = results["results"]
-    else:
-        logger.warning("Unexpected search result shape: %s", type(results))
-        return []
+    # Parse MCP content format: [{"type":"text","text":"[...]"}] → actual results
+    content = result.get("content", [])
+    results = []
+
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text" and "text" in block:
+                try:
+                    parsed = json.loads(block["text"])
+                    if isinstance(parsed, list):
+                        results = parsed
+                        break
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            elif isinstance(block, dict) and "vec_score" in block:
+                results.append(block)  # Direct result object
+
+    if not results:
+        # Fallback: results might be in a different shape
+        if isinstance(content, list) and all(isinstance(r, dict) and "vec_score" in r for r in content):
+            results = content
+        elif isinstance(result, list) and all(isinstance(r, dict) and "vec_score" in r for r in result):
+            results = result
 
     # Filter by vec_score threshold
     threshold = 0.75
     filtered = [r for r in results if r.get("vec_score", 0) > threshold]
-    logger.info("Search: %d results, %d above vec_score %.2f", len(results), len(filtered), threshold)
+    logger.info("Search: %d raw results, %d above vec_score %.2f", len(results), len(filtered), threshold)
     return filtered
 
 
