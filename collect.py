@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""DS-004 Pipeline — Semantic Consolidation Engine.
+"""DS-004 Pipeline — Semantic Consolidation Engine (v3.0 SYNAPSE).
 
-Watches for new episodic notes in the knowledge vault, uses k-mcp
-hybrid search to find semantically related knowledge, and calls
-DeepSeek LLM to consolidate concepts into semantic concept pages.
+Watches for new episodic notes in the knowledge vault, groups them
+by topic/ frontmatter tags, and calls DeepSeek LLM to consolidate
+concepts into semantic concept pages.
 
-Architecture:
+Architecture (v3.0):
     DS-001 pipeline writes new episodic note to /vault/
       → ds004-pipeline detects new file
-      → k-mcp search finds semantically similar old notes
-      → If match_count >= θ (2), trigger consolidation
-      → DeepSeek LLM updates/creates concept pages
+      → Group by topic/ frontmatter tags (no k-mcp search)
+      → If article_count >= θ (2), trigger consolidation
+      → DeepSeek LLM updates/creates concept pages per tag
+      → Inject [[wikilinks]] into source episodic notes
+      → Build cross-concept association edges
       → Updates index.md and log.md
 
 Usage:
@@ -98,14 +100,13 @@ def _run_consolidate() -> None:
 
     summary_counts = summary  # Flat keys for backward compat logging
     logger.info("=" * 60)
-    logger.info("DS-004 Consolidation Summary:")
+    logger.info("DS-004 Consolidation Summary (v3.0 SYNAPSE):")
     logger.info("  New notes found:        %d", summary_counts.get("new_notes", 0))
-    logger.info("  Consolidated:           %d", summary_counts.get("consolidated", 0))
+    logger.info("  Consolidated (tags):    %d", summary_counts.get("consolidated", 0))
     logger.info("  Skipped (below θ):      %d", summary_counts.get("skipped", 0))
     logger.info("  Errors:                 %d", summary_counts.get("errors", 0))
-    logger.info("  Frontmatter validated:  %d", summary_counts.get("frontmatter_validated", 0))
-    logger.info("  Frontmatter fallbacks:  %d", summary_counts.get("frontmatter_fallback", 0))
-    logger.info("  Related injected:       %d", summary_counts.get("related_injected", 0))
+    logger.info("  Wikilinks injected:     %d", summary_counts.get("wikilinks_injected", 0))
+    logger.info("  Cross-concept links:    %d", summary_counts.get("cross_concept_links", 0))
     logger.info("=" * 60)
 
     # The full report (with pipeline, token_usage, memory sections) is

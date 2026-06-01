@@ -1,13 +1,14 @@
 """Knowledge-MCP HTTP client for DS-004 pipeline.
 
 Sends MCP JSON-RPC 2.0 requests to ``knowledge-mcp:8000/mcp``
-to search, read, write, and update notes in the vault.
+to search, read, write, update, embed, and manage notes in the vault.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -202,6 +203,39 @@ def update_note(path: str, old_string: str, new_string: str) -> bool:
         return False
     logger.info("Updated note: %s", path)
     return True
+
+
+def embed(text: str) -> list[float] | None:
+    """Generate embedding vector for text via k-mcp embed tool.
+
+    Returns a list of floats (384-dimensional embedding vector),
+    or None if the k-mcp embed call fails.
+    """
+    result = _call_tool("embed", {"text": text})
+    if result is None:
+        return None
+    # Parse MCP content format
+    content = result.get("content", [])
+    if isinstance(content, list) and content:
+        text_content = content[0].get("text", "[]")
+        try:
+            return json.loads(text_content)
+        except (json.JSONDecodeError, TypeError):
+            logger.error("Failed to parse embed response")
+            return None
+    return None
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Compute cosine similarity between two embedding vectors.
+
+    Both vectors are assumed to be L2-normalized, so cosine similarity
+    equals the dot product. This implementation works for any vectors.
+    """
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
 
 
 def index_status() -> dict[str, Any] | None:
