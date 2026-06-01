@@ -112,11 +112,12 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def search(query: str, limit: int = 10) -> list[dict[str, Any]]:
+def search(query: str, limit: int = 10, exclude_path: str | None = None) -> list[dict[str, Any]]:
     """Search the vault using hybrid (BM25 + vector) search.
 
     Returns list of {path, section_title, snippet, bm25_score, vec_score, combined_score}.
     Only results with vec_score > 0.75 are returned.
+    Filters out log.md, index.md, SCHEMA.md, and excluded path.
     """
     result = _call_tool("search", {"query": query, "limit": limit})
     if result is None:
@@ -149,7 +150,16 @@ def search(query: str, limit: int = 10) -> list[dict[str, Any]]:
     # Filter by vec_score threshold
     threshold = 0.75
     filtered = [r for r in results if r.get("vec_score", 0) > threshold]
-    logger.info("Search: %d raw results, %d above vec_score %.2f", len(results), len(filtered), threshold)
+
+    # Filter out non-episodic files (log.md, index.md, SCHEMA.md)
+    excluded_files = {"log.md", "index.md", "SCHEMA.md"}
+    filtered = [r for r in filtered if r.get("path") not in excluded_files]
+
+    # Exclude specific path (e.g., the note being consolidated)
+    if exclude_path:
+        filtered = [r for r in filtered if r.get("path") != exclude_path]
+
+    logger.info("Search: %d raw results, %d after filters", len(results), len(filtered))
     return filtered
 
 

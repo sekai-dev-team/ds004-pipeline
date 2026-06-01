@@ -25,6 +25,7 @@ Modes:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import time
@@ -94,14 +95,19 @@ def main() -> None:
 def _run_consolidate() -> None:
     """Run a single consolidation pass."""
     summary = consolidate_all()
-    
+
+    summary_counts = summary  # Flat keys for backward compat logging
     logger.info("=" * 60)
     logger.info("DS-004 Consolidation Summary:")
-    logger.info("  New notes found:   %d", summary.get("new_notes", 0))
-    logger.info("  Consolidated:      %d", summary.get("consolidated", 0))
-    logger.info("  Skipped (below θ): %d", summary.get("skipped", 0))
-    logger.info("  Errors:            %d", summary.get("errors", 0))
+    logger.info("  New notes found:   %d", summary_counts.get("new_notes", 0))
+    logger.info("  Consolidated:      %d", summary_counts.get("consolidated", 0))
+    logger.info("  Skipped (below θ): %d", summary_counts.get("skipped", 0))
+    logger.info("  Errors:            %d", summary_counts.get("errors", 0))
     logger.info("=" * 60)
+
+    # The full report (with pipeline, token_usage, memory sections) is
+    # already printed to stdout by consolidate_all() → _write_report()
+    # The ds004-consolidate.sh cron script captures this line.
 
 
 def _run_watch(interval: int) -> None:

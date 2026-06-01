@@ -1,15 +1,17 @@
-"""DS-004 Semantic Consolidation Engine.
+"""DS-004 Semantic Consolidation Engine — v2.1 (Prompt + Memory Optimized).
 
 Core logic for:
 1. Detecting new episodic notes in the vault
-2. Semantic search for related knowledge
+2. Semantic search for related knowledge (filtered, summary-based query)
 3. Trigger decision (RecMem lazy consolidation)
-4. LLM consolidation into concept pages
+4. LLM consolidation into concept pages (compact prompt, on-demand concept loading)
 5. Maintaining index.md and log.md
+6. Monitoring report generation
 """
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
@@ -42,6 +44,8 @@ VEC_SCORE_THRESHOLD = 0.75
 MAX_QUERY_CHARS = 2000
 # Maximum old note chars to include as context
 MAX_CONTEXT_CHARS = 1000
+# Maximum notes to process per consolidate_all() run
+MAX_NOTES_PER_RUN = 50
 
 VAULT_PATH = os.environ.get("DS004_VAULT_PATH", "/vault")
 STATE_FILE = os.path.join(VAULT_PATH, ".ds004_state.json")
@@ -153,21 +157,43 @@ def _find_new_episodic_notes() -> list[str]:
     return new_notes
 
 
-def _build_search_query(content: str) -> str:
-    """Extract a search query from note content (first MAX_QUERY_CHARS chars)."""
+def _extract_summary(content: str, max_chars: int = 500) -> str:
+    """Extract the ## 摘要 (summary) section from note content.
+
+    Falls back to the first max_chars of content if no summary section found.
+    """
     # Strip frontmatter
     if content.startswith("---"):
         end = content.find("---", 3)
         if end != -1:
             content = content[end + 3:]
 
-    # Clean up markdown formatting
-    content = content.strip()
-    # Take first N characters
-    if len(content) > MAX_QUERY_CHARS:
-        content = content[:MAX_QUERY_CHARS]
+    # Look for ## 摘要 section
+    summary_match = re.search(
+        r'^##\s+摘要\s*\n(.*?)(?=\n##\s|\Z)',
+        content,
+        re.MULTILINE | re.DOTALL,
+    )
+    if summary_match:
+        result = summary_match.group(1).strip()
+        if len(result) > max_chars:
+            result = result[:max_chars] + "\n\n[...truncated...]"
+        return result
 
+    # Fallback: first max_chars after frontmatter
+    content = content.strip()
+    if len(content) > max_chars:
+        content = content[:max_chars] + "\n\n[...truncated...]"
     return content
+
+
+def _build_search_query(content: str) -> str:
+    """Extract a search query from note content, preferring the ## 摘要 section.
+
+    The 摘要 section is more focused than full text, yielding better search results.
+    """
+    summary = _extract_summary(content, max_chars=MAX_QUERY_CHARS)
+    return summary
 
 
 def _truncate_context(content: str, max_chars: int = MAX_CONTEXT_CHARS) -> str:
@@ -182,33 +208,80 @@ def _truncate_context(content: str, max_chars: int = MAX_CONTEXT_CHARS) -> str:
     return content
 
 
-def _read_concept_pages() -> dict[str, str]:
-    """Read all existing concept pages from /vault/concepts/.
+def _read_concept_pages(concept_names: list[str] | None = None) -> dict[str, str]:
+    """Read concept pages from /vault/concepts/, optionally only specific ones.
 
-    Returns dict of {concept_name: full_content}.
+    Args:
+        concept_names: Optional list of concept names (without .md extension).
+                       If None (default), loads ALL concept pages (legacy behavior).
+                       For v2.1 optimization, pass only relevant concept names.
+
+    Returns dict of {filename: full_content}.
     """
     concepts: dict[str, str] = {}
     concepts_dir = Path(VAULT_PATH) / "concepts"
     if not concepts_dir.is_dir():
         return concepts
 
-    for entry in sorted(concepts_dir.iterdir()):
-        if entry.suffix == ".md":
+    if concept_names is not None:
+        # On-demand: load only the specified concept pages
+        for name in concept_names:
+            filename = f"{name}.md"
+            filepath = concepts_dir / filename
             try:
-                concepts[entry.name] = entry.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
+                concepts[filename] = filepath.read_text(encoding="utf-8")
+            except (OSError, FileNotFoundError):
                 pass
+    else:
+        # Legacy: load all concept pages
+        for entry in sorted(concepts_dir.iterdir()):
+            if entry.suffix == ".md":
+                try:
+                    concepts[entry.name] = entry.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    pass
 
     return concepts
 
 
-def _read_schema() -> str:
-    """Read SCHEMA.md if it exists."""
-    schema_path = Path(VAULT_PATH) / "SCHEMA.md"
-    try:
-        return schema_path.read_text(encoding="utf-8")
-    except (OSError, FileNotFoundError):
-        return "(No SCHEMA.md found)"
+def _find_relevant_concepts(
+    matched_notes: list[dict[str, Any]],
+    max_concepts: int = 3,
+) -> list[str]:
+    """Determine relevant concept pages from matched notes' topic tags.
+
+    Reads matched notes' frontmatter to extract topic/ tags (e.g., topic/agent_memory),
+    converts them to concept page names (e.g., agent-memory).
+    Returns up to max_concepts concept names (without .md extension).
+    """
+    concept_names: list[str] = []
+
+    for note in matched_notes:
+        note_path = note.get("path", "")
+        if not note_path:
+            continue
+
+        content = read_vault_file(note_path)
+        if not content:
+            continue
+
+        fm = _parse_frontmatter(content)
+        tags = fm.get("tags", [])
+        if not isinstance(tags, list):
+            continue
+
+        for tag in tags:
+            if isinstance(tag, str) and tag.startswith("topic/"):
+                # topic/agent_memory → agent-memory
+                topic_name = tag[len("topic/"):]
+                concept_name = topic_name.replace("_", "-")
+                if concept_name not in concept_names:
+                    concept_names.append(concept_name)
+
+        if len(concept_names) >= max_concepts:
+            break
+
+    return concept_names[:max_concepts]
 
 
 def _build_consolidation_prompt(
@@ -216,98 +289,90 @@ def _build_consolidation_prompt(
     new_note_content: str,
     matched_notes: list[dict[str, Any]],
     concept_pages: dict[str, str],
-    schema: str,
 ) -> tuple[str, str]:
-    """Build the system prompt and user message for LLM consolidation.
+    """Build a compact system prompt and user message for LLM consolidation.
+
+    v2.1 optimizations:
+    - System prompt reduced from ~1966 to ~800 chars
+    - New note: uses ## 摘要 (summary) section, max 500 chars (was 8000)
+    - Matched notes: uses 摘要 from each note, max 300 chars (was 1000 snippet)
+    - Concept pages: top 3 only, max 1000 chars each (was all 74 × 2000)
+    - Schema section removed (no informational value)
 
     Returns (system_prompt, user_message).
     """
-    system_prompt = """You are the DS-004 Semantic Consolidation Engine. Your job is to maintain a knowledge vault using the Karpathy LLM Wiki pattern — markdown concept pages that are incrementally updated as new episodic notes arrive.
+    system_prompt = (
+        "You are DS-004 Consolidation Engine. Given a new episodic note "
+        "and related context, update or create concept pages incrementally.\n\n"
+        "Rules:\n"
+        "1. Map topic to kebab-case concept name (e.g., \"agent-memory\").\n"
+        "2. EXISTING page → UPDATE: add link to \"## 相关文章\", append new "
+        "content, update \"## 趋势判断\" if temporal patterns visible, "
+        "update last_updated. If contradiction, add \"⚠️ 矛盾标注\".\n"
+        "3. NEW page → CREATE with memory_type: semantic frontmatter.\n"
+        "4. Never rewrite entire pages — always incremental.\n\n"
+        "Output ONLY valid JSON:\n"
+        '{"concepts_to_update": [{"name": "...", "title": "...", '
+        '"action": "update|create", "full_page_content": "..."}], '
+        '"index_update": "...", "log_entry": "..."}'
+    )
 
-## Vault Structure
-- `/vault/*.md` — episodic notes (immutable, output from DS-001 pipeline)
-- `/vault/concepts/{name}.md` — semantic concept pages (you maintain these)
-- `/vault/index.md` — vault directory (you maintain)
-- `/vault/log.md` — operation log (append-only)
-
-## Your Task
-Given a new episodic note, determine which concept(s) it relates to, then produce the exact text content for updating/creating concept pages.
-
-## Rules
-1. Map the topic to a concept name in kebab-case (e.g., "agent-memory", "multi-agent-architecture").
-2. If a concept page exists, UPDATE it incrementally:
-   - Add the new note link to "## 相关文章" section
-   - If new content adds a new angle, append a paragraph under an appropriate sub-heading
-   - Update "## 趋势判断" if temporal patterns are visible across the matched notes
-   - Update `last_updated` in frontmatter to today's date
-   - If new note CONTRADICTS existing content: add "⚠️ 矛盾标注" section, do NOT delete old content
-3. If concept page doesn't exist, CREATE it following the template.
-4. Never rewrite entire concept pages — always incremental.
-5. Be concise but substantive.
-
-## Output Format
-You MUST output a JSON object with these fields:
-```json
-{
-  "concepts_to_update": [
-    {
-      "name": "kebab-case-concept-name",
-      "title": "Human-readable title",
-      "action": "update" or "create",
-      "full_page_content": "Complete markdown content for the concept page (frontmatter + body)"
-    }
-  ],
-  "index_update": "Content to append or update in index.md. Use ### for new entries.",
-  "log_entry": "Single line starting with ## [timestamp] format for log.md"
-}
-```
-
-IMPORTANT: Output ONLY the JSON object, no other text. The `full_page_content` must be valid markdown with YAML frontmatter."""
-
-    # Build user message with all context
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%Y-%m-%d")
     timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # v2.1: new note uses summary (max 500 chars instead of 8000)
+    new_note_summary = _extract_summary(new_note_content, max_chars=500)
 
     user_lines = [
         f"## New Episodic Note",
         f"**File:** {new_note_path}",
         f"**Date:** {date_str}",
         f"**Timestamp:** {timestamp}",
-        f"",
-        f"```markdown",
-        new_note_content[:8000],  # Limit to avoid token overflow
-        f"```",
-        f"",
+        "",
+        "```markdown",
+        new_note_summary,
+        "```",
+        "",
     ]
 
     if matched_notes:
-        user_lines.append(f"## Matched Related Notes ({len(matched_notes)} found)")
+        user_lines.append(
+            f"## Matched Related Notes ({len(matched_notes)} found)"
+        )
         user_lines.append("")
         for i, note in enumerate(matched_notes[:5], 1):
             path = note.get("path", "unknown")
             score = note.get("vec_score", 0)
-            snippet = note.get("snippet", "")
+            # v2.1: use 摘要 section from each matched note (300 chars)
+            note_content = read_vault_file(path)
+            summary = (
+                _extract_summary(note_content, max_chars=300)
+                if note_content
+                else ""
+            )
             user_lines.append(f"### {i}. {path} (score: {score:.3f})")
-            user_lines.append(f"```")
-            user_lines.append(snippet[:MAX_CONTEXT_CHARS])
-            user_lines.append(f"```")
+            user_lines.append("```")
+            user_lines.append(
+                summary if summary else note.get("snippet", "")[:300]
+            )
+            user_lines.append("```")
             user_lines.append("")
 
     if concept_pages:
-        user_lines.append(f"## Existing Concept Pages ({len(concept_pages)} total)")
+        user_lines.append(
+            f"## Existing Concept Pages ({len(concept_pages)} total)"
+        )
         user_lines.append("")
         for name, content in sorted(concept_pages.items()):
             user_lines.append(f"### {name}")
-            user_lines.append(f"```markdown")
-            user_lines.append(_truncate_context(content, 2000))
-            user_lines.append(f"```")
+            user_lines.append("```markdown")
+            # v2.1: each concept page truncated to 1000 chars (was 2000)
+            user_lines.append(_truncate_context(content, 1000))
+            user_lines.append("```")
             user_lines.append("")
 
-    user_lines.append("## Vault Schema (SCHEMA.md)")
-    user_lines.append("```markdown")
-    user_lines.append(schema[:2000] if schema else "(empty)")
-    user_lines.append("```")
+    # v2.1: Schema section removed — no informational value
 
     return system_prompt, "\n".join(user_lines)
 
@@ -398,61 +463,100 @@ def _append_log_md(log_entry: str) -> bool:
     return write_vault_file("log.md", updated)
 
 
-def consolidate(note_path: str) -> bool:
+def consolidate(note_path: str) -> dict[str, Any]:
     """Run full consolidation pipeline for a single new episodic note.
+
+    v2.1 changes:
+    - Returns rich dict instead of bool (includes concepts, token estimates)
+    - On-demand concept page loading (only relevant concepts)
+    - Explicit `del` + `gc.collect()` after consolidation for memory cleanup
+    - exclude_path passed to search() to filter self + log.md at source
 
     Args:
         note_path: Relative path to the episodic note in the vault.
 
     Returns:
-        True if consolidation was triggered and completed, False if skipped.
+        Dict with keys: success (bool), action (str: consolidated|skipped|error),
+        concepts (list of {name, action}), input_chars (int), output_chars (int).
     """
     logger.info("=== Consolidating: %s ===", note_path)
+
+    result: dict[str, Any] = {
+        "success": False,
+        "action": "error",
+        "concepts": [],
+        "input_chars": 0,
+        "output_chars": 0,
+    }
 
     # Step 1: Read the new note
     content = read_vault_file(note_path)
     if not content:
         logger.error("Could not read note: %s", note_path)
-        return False
+        return {**result, "action": "error"}
 
     # Step 2: Semantic search for related notes
+    # v2.1: exclude_path passed to search() filters log.md + self at source
     query = _build_search_query(content)
     logger.info("Search query: %s", query[:200])
-    
-    results = search(query, limit=10)
-    
-    # Filter to episodic notes only, exclude self
+
+    results = search(query, limit=10, exclude_path=note_path)
+
+    # Filter to episodic notes only (skip subdirectory paths)
     related = [
         r for r in results
-        if r.get("path") != note_path
-        and not any(skip in r.get("path", "") for skip in SKIP_DIRS)
+        if not any(skip in r.get("path", "") for skip in SKIP_DIRS)
     ]
 
     match_count = len(related)
-    logger.info("Found %d related notes (vec_score > %.2f)", match_count, VEC_SCORE_THRESHOLD)
+    logger.info(
+        "Found %d related notes (vec_score > %.2f)",
+        match_count,
+        VEC_SCORE_THRESHOLD,
+    )
 
     for r in related[:5]:
-        logger.info("  - %s (score: %.3f) %s", r.get("path", "?"), r.get("vec_score", 0), r.get("snippet", "")[:80])
+        logger.info("  - %s (score: %.3f)", r.get("path", "?"), r.get("vec_score", 0))
 
     # Step 3: Trigger decision (RecMem pattern)
     if match_count < MATCH_THRESHOLD:
         log_msg = f"[skip] {note_path} — only {match_count} related notes found"
         logger.info(log_msg)
         _append_log_md(log_msg)
-        # Mark as processed even if skipped
         processed, _ = _load_state()
         processed.add(note_path)
         _save_state(processed)
-        return False
+        return {**result, "success": False, "action": "skipped"}
 
-    logger.info("Trigger threshold met: %d >= %d — proceeding to LLM consolidation", match_count, MATCH_THRESHOLD)
+    logger.info(
+        "Trigger threshold met: %d >= %d — proceeding to LLM consolidation",
+        match_count,
+        MATCH_THRESHOLD,
+    )
 
     # Step 4: Gather context for LLM
-    concept_pages = _read_concept_pages()
-    schema = _read_schema()
+    # v2.1: on-demand concept loading — only load relevant concepts from matched notes
+    relevant_concepts = _find_relevant_concepts(related, max_concepts=3)
+    concept_pages = _read_concept_pages(
+        relevant_concepts if relevant_concepts else None
+    )
+    logger.info(
+        "Loaded %d relevant concept pages: %s",
+        len(concept_pages),
+        list(concept_pages.keys()),
+    )
 
+    # v2.1: _build_consolidation_prompt no longer takes schema param
     system_prompt, user_message = _build_consolidation_prompt(
-        note_path, content, related, concept_pages, schema
+        note_path, content, related, concept_pages
+    )
+
+    prompt_chars = len(system_prompt) + len(user_message)
+    logger.info(
+        "Prompt size: ~%d chars (system: %d, user: %d) — target < 8000",
+        prompt_chars,
+        len(system_prompt),
+        len(user_message),
     )
 
     # Step 5: Call DeepSeek LLM
@@ -468,14 +572,16 @@ def consolidate(note_path: str) -> bool:
         logger.error("DeepSeek LLM call failed: %s", exc)
         _append_log_md(f"[error] {note_path} — LLM call failed: {exc}")
         _mark_failed(note_path, str(exc))
-        return False
+        return {**result, "action": "error"}
 
     # Step 6: Parse LLM output
     parsed = _parse_llm_json(llm_response)
     if not parsed:
-        logger.error("Failed to parse LLM output, raw response: %s", llm_response[:500])
+        logger.error(
+            "Failed to parse LLM output, raw response: %s", llm_response[:500]
+        )
         _append_log_md(f"[error] {note_path} — failed to parse LLM output")
-        return False
+        return {**result, "action": "error"}
 
     # Step 7: Write updated concept pages
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -497,8 +603,9 @@ def consolidate(note_path: str) -> bool:
             write_note(concept_path, full_content, force=True)
         else:
             logger.info("Updating concept page: %s", concept_path)
-            # Write the full updated content
             write_vault_file(concept_path, full_content)
+
+        result["concepts"].append({"name": name, "action": action})
 
     # Step 8: Update index.md
     index_update = parsed.get("index_update", "")
@@ -506,9 +613,11 @@ def consolidate(note_path: str) -> bool:
         _update_index_md(index_update)
 
     # Step 9: Update log.md
-    log_entry = parsed.get("log_entry", f"ingest | {note_path} → consolidated")
     concept_names = [c.get("name", "unknown") for c in concepts_to_update]
-    log_line = f"ingest | {note_path} → updated {', '.join(concept_names)} ({match_count} related)"
+    log_line = (
+        f"ingest | {note_path} → updated {', '.join(concept_names)} "
+        f"({match_count} related)"
+    )
     _append_log_md(log_line)
 
     # Mark as processed
@@ -517,37 +626,174 @@ def consolidate(note_path: str) -> bool:
     _save_state(processed)
 
     logger.info("=== Consolidation complete: %s ===", note_path)
-    return True
+
+    # v2.1: track token estimates for monitoring report
+    result["success"] = True
+    result["action"] = "consolidated"
+    result["input_chars"] = prompt_chars
+    result["output_chars"] = len(llm_response)
+
+    # v2.1: explicit memory cleanup — del large strings + gc.collect()
+    del content, concept_pages, system_prompt, user_message
+    del llm_response, parsed, concepts_to_update
+    gc.collect()
+
+    return result
+
+
+def _get_peak_rss_mb() -> int:
+    """Get peak RSS memory in MB from /proc/self/status (Linux only)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmPeak:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, IndexError, ValueError):
+        pass
+    return 0
+
+
+def _build_report(
+    summary: dict[str, int],
+    per_concept: dict[str, dict],
+    total_input_chars: int,
+    total_output_chars: int,
+) -> dict[str, Any]:
+    """Build the monitoring report dict.
+
+    Args:
+        summary: {new_notes, consolidated, skipped, errors}
+        per_concept: {concept_name: {action: str, related_notes: int}}
+        total_input_chars: Accumulated input prompt chars across all calls.
+        total_output_chars: Accumulated output chars across all calls.
+
+    Returns:
+        Full report dict matching the DS-004 v2.1 spec format.
+    """
+    now = datetime.now(timezone.utc)
+    timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Rough estimate: 4 chars ≈ 1 token for mixed Chinese/English
+    total_input_tokens = total_input_chars // 4
+    total_output_tokens = total_output_chars // 4
+
+    # DeepSeek v4 flash pricing (approx): $0.15/M input, $0.60/M output
+    estimated_cost = (
+        total_input_tokens * 0.00000015 + total_output_tokens * 0.0000006
+    )
+
+    return {
+        "pipeline": "ds004-consolidate",
+        "timestamp": timestamp,
+        "summary": {
+            "new_notes": summary["new_notes"],
+            "consolidated": summary["consolidated"],
+            "skipped": summary["skipped"],
+            "errors": summary["errors"],
+        },
+        "token_usage": {
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
+            "estimated_cost_usd": round(estimated_cost, 6),
+        },
+        "per_concept": per_concept,
+        "memory": {
+            "peak_rss_mb": _get_peak_rss_mb(),
+        },
+    }
+
+
+def _write_report(report: dict[str, Any]) -> None:
+    """Write monitoring report to vault and stdout.
+
+    Writes machine-readable JSON to /vault/reports/consolidate-{timestamp}.json
+    and prints the same JSON to stdout for shell script parsing.
+    """
+    # Write to vault
+    timestamp_safe = report["timestamp"].replace(":", "-")
+    report_path = f"reports/consolidate-{timestamp_safe}.json"
+    report_content = json.dumps(report, ensure_ascii=False, indent=2)
+    write_vault_file(report_path, report_content)
+    logger.info("Report written to vault: %s", report_path)
+
+    # Print machine-readable JSON to stdout (for ds004-consolidate.sh to parse)
+    print(json.dumps(report, ensure_ascii=False), flush=True)
 
 
 def consolidate_all() -> dict[str, Any]:
-    """Scan for all new episodic notes and consolidate them.
+    """Scan for new episodic notes and consolidate them, with monitoring report.
 
-    Returns summary dict with counts.
+    v2.1 changes:
+    - Limited to MAX_NOTES_PER_RUN (50) notes per call
+    - Returns full report dict with token/memory telemetry
+    - Writes monitoring report to /vault/reports/consolidate-{timestamp}.json
+    - Prints JSON report to stdout for external cron script consumption
+
+    Returns:
+        Report dict with summary, token_usage, per_concept, memory sections.
+        Flat keys (new_notes, consolidated, etc.) kept for backward compat.
     """
     new_notes = _find_new_episodic_notes()
-    
+
     if not new_notes:
         logger.info("No new episodic notes found")
-        return {"new_notes": 0, "consolidated": 0, "skipped": 0}
+        report = _build_report(
+            {"new_notes": 0, "consolidated": 0, "skipped": 0, "errors": 0},
+            {},
+            0,
+            0,
+        )
+        _write_report(report)
+        return {"new_notes": 0, "consolidated": 0, "skipped": 0, "errors": 0}
+
+    # v2.1: limit to MAX_NOTES_PER_RUN
+    if len(new_notes) > MAX_NOTES_PER_RUN:
+        logger.warning(
+            "Truncating %d new notes to %d (max per run)",
+            len(new_notes),
+            MAX_NOTES_PER_RUN,
+        )
+        new_notes = new_notes[:MAX_NOTES_PER_RUN]
 
     logger.info("Found %d new episodic notes", len(new_notes))
-    
+
     consolidated = 0
     skipped = 0
     errors = 0
+    per_concept: dict[str, dict] = {}
+    total_input_chars = 0
+    total_output_chars = 0
 
     for note_path in new_notes:
         try:
-            result = consolidate(note_path)
-            if result:
+            note_result = consolidate(note_path)
+            action = note_result.get("action", "error")
+            if action == "consolidated":
                 consolidated += 1
-            else:
+            elif action == "skipped":
                 skipped += 1
+            else:
+                errors += 1
+
+            # Accumulate token estimates
+            total_input_chars += note_result.get("input_chars", 0)
+            total_output_chars += note_result.get("output_chars", 0)
+
+            # Track per-concept actions for report
+            for c in note_result.get("concepts", []):
+                name = c["name"]
+                if name not in per_concept:
+                    per_concept[name] = {
+                        "action": c["action"],
+                        "related_notes": 0,
+                    }
+                per_concept[name]["related_notes"] += 1
+
         except Exception as exc:
-            logger.error("Error consolidating '%s': %s", note_path, exc, exc_info=True)
+            logger.error(
+                "Error consolidating '%s': %s", note_path, exc, exc_info=True
+            )
             errors += 1
-            # Still mark as processed to avoid infinite retries
             processed, _ = _load_state()
             processed.add(note_path)
             _save_state(processed)
@@ -558,5 +804,12 @@ def consolidate_all() -> dict[str, Any]:
         "skipped": skipped,
         "errors": errors,
     }
-    logger.info("Consolidation round complete: %s", summary)
-    return summary
+
+    # Build and write monitoring report
+    report = _build_report(
+        summary, per_concept, total_input_chars, total_output_chars
+    )
+    _write_report(report)
+
+    logger.info("Consolidation round complete: %s", report)
+    return {**summary, "_report": report}
