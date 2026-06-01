@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # Trigger threshold: at least θ matching old notes required
 MATCH_THRESHOLD = 2
 # Vector score threshold for matching
-VEC_SCORE_THRESHOLD = 0.75
+VEC_SCORE_THRESHOLD = 0.90
 # Maximum query characters for search
 MAX_QUERY_CHARS = 2000
 # Maximum old note chars to include as context
