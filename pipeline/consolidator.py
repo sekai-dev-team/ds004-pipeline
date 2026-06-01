@@ -196,6 +196,33 @@ def _build_search_query(content: str) -> str:
     return summary
 
 
+def _find_all_related(note_path: str, content: str, limit: int = 15) -> list[dict[str, Any]]:
+    """Search k-mcp for all related articles, filtering out self and non-episodic paths.
+
+    Args:
+        note_path: Path of the note being consolidated (excluded from results).
+        content: Note content used to build search query.
+        limit: Maximum number of results to return (default 15).
+
+    Returns:
+        List of dicts with path, vec_score, snippet, etc., sorted by vec_score desc.
+    """
+    query = _build_search_query(content)
+    # Search with a higher limit than needed — search() already filters by vec_score > 0.75
+    results = search(query, limit=max(limit * 2, 20), exclude_path=note_path)
+
+    # Filter out subdirectory paths (concepts, insights, digests, etc.)
+    related = [
+        r for r in results
+        if not any(skip in r.get("path", "") for skip in SKIP_DIRS)
+    ]
+
+    # Sort by vec_score descending
+    related.sort(key=lambda r: r.get("vec_score", 0), reverse=True)
+
+    return related[:limit]
+
+
 def _truncate_context(content: str, max_chars: int = MAX_CONTEXT_CHARS) -> str:
     """Truncate content for LLM context, stripping frontmatter."""
     if content.startswith("---"):
@@ -303,17 +330,20 @@ def _build_consolidation_prompt(
     """
     system_prompt = (
         "You are DS-004 Consolidation Engine. Given a new episodic note "
-        "and related context, update or create concept pages incrementally.\n\n"
+        "and related context, produce concept page body content.\n\n"
         "Rules:\n"
         "1. Map topic to kebab-case concept name (e.g., \"agent-memory\").\n"
-        "2. EXISTING page → UPDATE: add link to \"## 相关文章\", append new "
-        "content, update \"## 趋势判断\" if temporal patterns visible, "
-        "update last_updated. If contradiction, add \"⚠️ 矛盾标注\".\n"
-        "3. NEW page → CREATE with memory_type: semantic frontmatter.\n"
-        "4. Never rewrite entire pages — always incremental.\n\n"
+        "2. EXISTING page → UPDATE: write body sections (概述, 核心观点, 趋势判断) "
+        "incorporating new information incrementally. "
+        "If contradiction detected, add \"⚠️ 矛盾标注\" section.\n"
+        "3. NEW page → CREATE: write fresh body content with 概述, 核心观点, 趋势判断 sections.\n"
+        "4. Never rewrite entire pages — always incremental.\n"
+        "5. Output ONLY body markdown. Do NOT include YAML frontmatter (---). "
+        "Do NOT include a '## 相关文章' section. "
+        "Frontmatter and related articles are injected by the pipeline.\n\n"
         "Output ONLY valid JSON:\n"
         '{"concepts_to_update": [{"name": "...", "title": "...", '
-        '"action": "update|create", "full_page_content": "..."}], '
+        '"action": "update|create", "body_content": "markdown body only"}], '
         '"index_update": "...", "log_entry": "..."}'
     )
 
@@ -377,8 +407,19 @@ def _build_consolidation_prompt(
     return system_prompt, "\n".join(user_lines)
 
 
-def _concept_page_template(name: str, title: str, date_str: str) -> str:
-    """Generate a new concept page from template."""
+def _concept_page_template(name: str, title: str, date_str: str, related_paths: list[str] | None = None) -> str:
+    """Generate a new concept page from template (used as fallback when LLM fails).
+
+    Args:
+        name: Concept name (kebab-case).
+        title: Page title.
+        date_str: ISO date string for created/last_updated.
+        related_paths: Optional list of related note paths for wikilinks.
+    """
+    related_lines = ""
+    if related_paths:
+        related_lines = "\n".join(f"- [[{p}]]" for p in related_paths)
+
     return f"""---
 memory_type: semantic
 concept: {name}
@@ -393,16 +434,98 @@ related_concepts: []
 ## 概述
 [Newly created concept page — overview will be filled as related episodic notes are ingested.]
 
-## 核心子主题
-
 ## 趋势判断
 No trend data yet — this concept was just created.
 
 ## 相关文章
 
-## ⚠️ 矛盾标注
+{related_lines}
 
-## 待探索问题
+## ⚠️ 矛盾标注
+"""
+
+
+def _validate_frontmatter(content: str) -> bool:
+    """Check that markdown content has valid frontmatter with required keys.
+
+    Required keys: memory_type, concept, created, last_updated.
+    Returns True if frontmatter is valid, False and logs a warning otherwise.
+    """
+    if not content.startswith("---"):
+        logger.warning("Frontmatter validation failed: content does not start with '---'")
+        return False
+    fm = _parse_frontmatter(content)
+    if not fm:
+        logger.warning("Frontmatter validation failed: could not parse YAML frontmatter")
+        return False
+    required = ["memory_type", "concept", "created", "last_updated"]
+    for key in required:
+        if key not in fm:
+            logger.warning("Frontmatter missing required key: %s", key)
+            return False
+    return True
+
+
+def _validate_related_section(content: str) -> bool:
+    """Check that content has a '## 相关文章' section with at least one wikilink.
+
+    Returns True if the section exists with ≥1 [[wikilink]], False otherwise.
+    """
+    if "## 相关文章" not in content:
+        logger.warning("Related section validation failed: missing '## 相关文章' heading")
+        return False
+    if not re.search(r'\[\[.*?\]\]', content):
+        logger.warning("Related section validation failed: no wikilinks found in '## 相关文章'")
+        return False
+    return True
+
+
+def _inject_frontmatter(
+    name: str,
+    title: str,
+    body_content: str,
+    related_paths: list[str],
+    date_str: str,
+    existing_created: str | None = None,
+) -> str:
+    """Generate complete markdown page with frontmatter, body, and related articles.
+
+    On updates, preserves the original 'created' date from the existing page.
+
+    Args:
+        name: Concept name (kebab-case).
+        title: Page title.
+        body_content: LLM-generated body markdown (no frontmatter, no related section).
+        related_paths: List of related note paths for wikilinks (sorted by relevance).
+        date_str: ISO date string for last_updated (and created if new).
+        existing_created: Original created date from existing page (preserved on update).
+
+    Returns:
+        Complete markdown content ready to write to vault.
+    """
+    created = existing_created if existing_created else date_str
+
+    related_lines = ""
+    if related_paths:
+        related_lines = "\n".join(f"- [[{p}]]" for p in related_paths)
+
+    return f"""---
+memory_type: semantic
+concept: {name}
+title: "{title}"
+tags: [type/semantic]
+created: {created}
+last_updated: {date_str}
+related_count: {len(related_paths)}
+---
+
+# {title}
+
+{body_content}
+
+## 相关文章
+
+{related_lines}
 """
 
 
@@ -477,7 +600,8 @@ def consolidate(note_path: str) -> dict[str, Any]:
 
     Returns:
         Dict with keys: success (bool), action (str: consolidated|skipped|error),
-        concepts (list of {name, action}), input_chars (int), output_chars (int).
+        concepts (list of {name, action}), input_chars (int), output_chars (int),
+        frontmatter_validated (int), frontmatter_fallback (int), related_injected (int).
     """
     logger.info("=== Consolidating: %s ===", note_path)
 
@@ -495,30 +619,21 @@ def consolidate(note_path: str) -> dict[str, Any]:
         logger.error("Could not read note: %s", note_path)
         return {**result, "action": "error"}
 
-    # Step 2: Semantic search for related notes
-    # v2.1: exclude_path passed to search() filters log.md + self at source
-    query = _build_search_query(content)
-    logger.info("Search query: %s", query[:200])
-
-    results = search(query, limit=10, exclude_path=note_path)
-
-    # Filter to episodic notes only (skip subdirectory paths)
-    related = [
-        r for r in results
-        if not any(skip in r.get("path", "") for skip in SKIP_DIRS)
-    ]
-
-    match_count = len(related)
+    # Step 2: Semantic search for related notes (v2.1: code-injected related articles)
+    all_related = _find_all_related(note_path, content, limit=20)
+    match_count = len(all_related)
     logger.info(
         "Found %d related notes (vec_score > %.2f)",
         match_count,
         VEC_SCORE_THRESHOLD,
     )
 
-    for r in related[:5]:
+    for r in all_related[:5]:
         logger.info("  - %s (score: %.3f)", r.get("path", "?"), r.get("vec_score", 0))
 
     # Step 3: Trigger decision (RecMem pattern)
+    # v2.1: trigger requires MATCH_THRESHOLD matches, but once triggered,
+    # ALL matches (up to 15) are injected as related articles.
     if match_count < MATCH_THRESHOLD:
         log_msg = f"[skip] {note_path} — only {match_count} related notes found"
         logger.info(log_msg)
@@ -536,7 +651,7 @@ def consolidate(note_path: str) -> dict[str, Any]:
 
     # Step 4: Gather context for LLM
     # v2.1: on-demand concept loading — only load relevant concepts from matched notes
-    relevant_concepts = _find_relevant_concepts(related, max_concepts=3)
+    relevant_concepts = _find_relevant_concepts(all_related, max_concepts=3)
     concept_pages = _read_concept_pages(
         relevant_concepts if relevant_concepts else None
     )
@@ -548,7 +663,7 @@ def consolidate(note_path: str) -> dict[str, Any]:
 
     # v2.1: _build_consolidation_prompt no longer takes schema param
     system_prompt, user_message = _build_consolidation_prompt(
-        note_path, content, related, concept_pages
+        note_path, content, all_related, concept_pages
     )
 
     prompt_chars = len(system_prompt) + len(user_message)
@@ -583,27 +698,61 @@ def consolidate(note_path: str) -> dict[str, Any]:
         _append_log_md(f"[error] {note_path} — failed to parse LLM output")
         return {**result, "action": "error"}
 
-    # Step 7: Write updated concept pages
+    # Step 7: Write updated concept pages (v2.1: code-injected frontmatter + related)
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     concepts_to_update = parsed.get("concepts_to_update", [])
 
+    # v2.1: Prepare related article paths for injection (up to 15, sorted by vec_score)
+    all_related_paths = [r.get("path", "") for r in all_related[:15]]
+    related_injected = 0
+    frontmatter_validated = 0
+    frontmatter_fallback = 0
+
     for concept in concepts_to_update:
         name = concept.get("name", "unknown")
+        title = concept.get("title", name)
         action = concept.get("action", "create")
-        full_content = concept.get("full_page_content", "")
+        body_content = concept.get("body_content", "")
 
-        if not full_content:
-            logger.warning("Empty content for concept '%s', skipping", name)
-            continue
+        if not body_content or not body_content.strip():
+            logger.warning(
+                "Empty body_content for concept '%s', using fallback", name
+            )
+            body_content = (
+                "## 概述\n\nLLM consolidation failed. "
+                "Related articles linked below.\n"
+            )
+            frontmatter_fallback += 1
 
         concept_path = f"concepts/{name}.md"
 
+        # On UPDATE, read existing frontmatter to preserve 'created' date
+        existing_created = None
+        if action == "update":
+            existing_content = read_vault_file(concept_path)
+            if existing_content:
+                existing_fm = _parse_frontmatter(existing_content)
+                existing_created = existing_fm.get("created")
+
+        # v2.1: code generates frontmatter + injects related articles
+        full_page = _inject_frontmatter(
+            name, title, body_content, all_related_paths,
+            date_str, existing_created,
+        )
+
+        # Validate
+        if _validate_frontmatter(full_page):
+            frontmatter_validated += 1
+        if _validate_related_section(full_page):
+            related_injected += 1
+
+        # Write to vault
         if action == "create":
             logger.info("Creating new concept page: %s", concept_path)
-            write_note(concept_path, full_content, force=True)
+            write_note(concept_path, full_page, force=True)
         else:
             logger.info("Updating concept page: %s", concept_path)
-            write_vault_file(concept_path, full_content)
+            write_vault_file(concept_path, full_page)
 
         result["concepts"].append({"name": name, "action": action})
 
@@ -616,7 +765,7 @@ def consolidate(note_path: str) -> dict[str, Any]:
     concept_names = [c.get("name", "unknown") for c in concepts_to_update]
     log_line = (
         f"ingest | {note_path} → updated {', '.join(concept_names)} "
-        f"({match_count} related)"
+        f"({match_count} related, {related_injected} injected)"
     )
     _append_log_md(log_line)
 
@@ -627,15 +776,18 @@ def consolidate(note_path: str) -> dict[str, Any]:
 
     logger.info("=== Consolidation complete: %s ===", note_path)
 
-    # v2.1: track token estimates for monitoring report
+    # v2.1: track token estimates and injection counts for monitoring report
     result["success"] = True
     result["action"] = "consolidated"
     result["input_chars"] = prompt_chars
     result["output_chars"] = len(llm_response)
+    result["frontmatter_validated"] = frontmatter_validated
+    result["frontmatter_fallback"] = frontmatter_fallback
+    result["related_injected"] = related_injected
 
     # v2.1: explicit memory cleanup — del large strings + gc.collect()
     del content, concept_pages, system_prompt, user_message
-    del llm_response, parsed, concepts_to_update
+    del llm_response, parsed, concepts_to_update, all_related, all_related_paths
     gc.collect()
 
     return result
@@ -662,7 +814,8 @@ def _build_report(
     """Build the monitoring report dict.
 
     Args:
-        summary: {new_notes, consolidated, skipped, errors}
+        summary: {new_notes, consolidated, skipped, errors,
+                  frontmatter_validated, frontmatter_fallback, related_injected}
         per_concept: {concept_name: {action: str, related_notes: int}}
         total_input_chars: Accumulated input prompt chars across all calls.
         total_output_chars: Accumulated output chars across all calls.
@@ -690,6 +843,9 @@ def _build_report(
             "consolidated": summary["consolidated"],
             "skipped": summary["skipped"],
             "errors": summary["errors"],
+            "frontmatter_validated": summary.get("frontmatter_validated", 0),
+            "frontmatter_fallback": summary.get("frontmatter_fallback", 0),
+            "related_injected": summary.get("related_injected", 0),
         },
         "token_usage": {
             "total_input_tokens": total_input_tokens,
@@ -738,13 +894,15 @@ def consolidate_all() -> dict[str, Any]:
     if not new_notes:
         logger.info("No new episodic notes found")
         report = _build_report(
-            {"new_notes": 0, "consolidated": 0, "skipped": 0, "errors": 0},
+            {"new_notes": 0, "consolidated": 0, "skipped": 0, "errors": 0,
+             "frontmatter_validated": 0, "frontmatter_fallback": 0, "related_injected": 0},
             {},
             0,
             0,
         )
         _write_report(report)
-        return {"new_notes": 0, "consolidated": 0, "skipped": 0, "errors": 0}
+        return {"new_notes": 0, "consolidated": 0, "skipped": 0, "errors": 0,
+                "frontmatter_validated": 0, "frontmatter_fallback": 0, "related_injected": 0}
 
     # v2.1: limit to MAX_NOTES_PER_RUN
     if len(new_notes) > MAX_NOTES_PER_RUN:
@@ -763,6 +921,9 @@ def consolidate_all() -> dict[str, Any]:
     per_concept: dict[str, dict] = {}
     total_input_chars = 0
     total_output_chars = 0
+    total_frontmatter_validated = 0
+    total_frontmatter_fallback = 0
+    total_related_injected = 0
 
     for note_path in new_notes:
         try:
@@ -778,6 +939,11 @@ def consolidate_all() -> dict[str, Any]:
             # Accumulate token estimates
             total_input_chars += note_result.get("input_chars", 0)
             total_output_chars += note_result.get("output_chars", 0)
+
+            # v2.1: accumulate injection/validation counts
+            total_frontmatter_validated += note_result.get("frontmatter_validated", 0)
+            total_frontmatter_fallback += note_result.get("frontmatter_fallback", 0)
+            total_related_injected += note_result.get("related_injected", 0)
 
             # Track per-concept actions for report
             for c in note_result.get("concepts", []):
@@ -803,6 +969,9 @@ def consolidate_all() -> dict[str, Any]:
         "consolidated": consolidated,
         "skipped": skipped,
         "errors": errors,
+        "frontmatter_validated": total_frontmatter_validated,
+        "frontmatter_fallback": total_frontmatter_fallback,
+        "related_injected": total_related_injected,
     }
 
     # Build and write monitoring report

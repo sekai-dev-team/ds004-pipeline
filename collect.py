@@ -99,10 +99,13 @@ def _run_consolidate() -> None:
     summary_counts = summary  # Flat keys for backward compat logging
     logger.info("=" * 60)
     logger.info("DS-004 Consolidation Summary:")
-    logger.info("  New notes found:   %d", summary_counts.get("new_notes", 0))
-    logger.info("  Consolidated:      %d", summary_counts.get("consolidated", 0))
-    logger.info("  Skipped (below θ): %d", summary_counts.get("skipped", 0))
-    logger.info("  Errors:            %d", summary_counts.get("errors", 0))
+    logger.info("  New notes found:        %d", summary_counts.get("new_notes", 0))
+    logger.info("  Consolidated:           %d", summary_counts.get("consolidated", 0))
+    logger.info("  Skipped (below θ):      %d", summary_counts.get("skipped", 0))
+    logger.info("  Errors:                 %d", summary_counts.get("errors", 0))
+    logger.info("  Frontmatter validated:  %d", summary_counts.get("frontmatter_validated", 0))
+    logger.info("  Frontmatter fallbacks:  %d", summary_counts.get("frontmatter_fallback", 0))
+    logger.info("  Related injected:       %d", summary_counts.get("related_injected", 0))
     logger.info("=" * 60)
 
     # The full report (with pipeline, token_usage, memory sections) is
