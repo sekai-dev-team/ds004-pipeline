@@ -404,6 +404,8 @@ def _build_tag_prompt(
     tag_name: str,
     note_paths: list[str],
     concept_content: str | None = None,
+    max_summary_chars: int = 500,
+    max_concept_chars: int = 2000,
 ) -> tuple[str, str]:
     """Build system prompt and user message for per-tag LLM consolidation.
 
@@ -450,7 +452,7 @@ def _build_tag_prompt(
         note_content = read_vault_file(note_path)
         if note_content:
             title = _extract_title(note_content)
-            summary = _extract_summary(note_content, max_chars=500)
+            summary = _extract_summary(note_content, max_chars=max_summary_chars)
         else:
             title = "Untitled"
             summary = "(could not read note)"
@@ -466,7 +468,7 @@ def _build_tag_prompt(
     if action == "update" and concept_content:
         user_lines.append("## Current Concept Page")
         user_lines.append("```markdown")
-        user_lines.append(_truncate_context(concept_content, max_chars=2000))
+        user_lines.append(_truncate_context(concept_content, max_chars=max_concept_chars))
         user_lines.append("```")
         user_lines.append("")
 
@@ -522,7 +524,7 @@ def _inject_concept_frontmatter(
 memory_type: semantic
 concept: {name}
 title: "{title}"
-tags: [type/semantic]
+tags: [type/semantic, topic/{name}]
 created: {created}
 last_updated: {date_str}
 ---
@@ -575,7 +577,18 @@ def _inject_wikilinks_to_notes(
             concept_page = tag_info.get("concept_page")
             if concept_page:
                 link = f"- [[{concept_page}]]"
-                if link not in content:
+                # M3: Check only within the "## 相关概念" section, not full content
+                section_match = re.search(
+                    r'^##\s+相关概念\s*\n(.*?)(?=\n##\s|\Z)',
+                    content,
+                    re.MULTILINE | re.DOTALL,
+                )
+                if section_match:
+                    section_content = section_match.group(1)
+                    if link not in section_content:
+                        wikilinks_to_add.append(link)
+                else:
+                    # No "## 相关概念" section exists yet — always add
                     wikilinks_to_add.append(link)
 
         if not wikilinks_to_add:
@@ -586,9 +599,16 @@ def _inject_wikilinks_to_notes(
 
         # If there's already a "## 相关概念" section, append to it
         if "## 相关概念" in content:
+            # M3: Check only within the section, not full content
+            section_match = re.search(
+                r'^##\s+相关概念\s*\n(.*?)(?=\n##\s|\Z)',
+                content,
+                re.MULTILINE | re.DOTALL,
+            )
+            section_content = section_match.group(1) if section_match else ""
             # Add new links after the heading
             for link in wikilinks_to_add:
-                if link not in content:
+                if link not in section_content:
                     # Simple append at end of file
                     updated = content.rstrip() + "\n" + link + "\n"
                     write_vault_file(note_path, updated)
@@ -655,7 +675,14 @@ def _build_cross_concept_links(
             similarity = cosine_similarity(source_embedding, other_embedding)
             if similarity > CROSS_CONCEPT_SIMILARITY_THRESHOLD:
                 link = f"- [[{other_concept_page}]]"
-                if link not in source_content:
+                # Check only within "## 相关概念" section for dedup
+                section_match = re.search(
+                    r'^##\s+相关概念\s*\n(.*?)(?=\n##\s|\Z)',
+                    source_content,
+                    re.MULTILINE | re.DOTALL,
+                )
+                section_content = section_match.group(1) if section_match else ""
+                if link not in section_content:
                     cross_links.append(link)
                     logger.info(
                         "Cross-concept link: %s ↔ %s (similarity: %.3f)",
@@ -867,6 +894,14 @@ def consolidate_all() -> dict[str, Any]:
     skipped_tags: list[str] = []
 
     for tag_name, note_paths in tag_groups.items():
+        # Cap notes per tag at 15, keeping most recent (sorted by path)
+        if len(note_paths) > 15:
+            logger.info(
+                "Tag '%s': capping %d notes → 15 (most recent)",
+                tag_name, len(note_paths),
+            )
+            note_paths = sorted(note_paths)[:15]
+
         tag_info = tag_library.get(tag_name, {})
         concept_page = tag_info.get("concept_page")
         article_count = tag_info.get("article_count", len(note_paths))
@@ -913,6 +948,59 @@ def consolidate_all() -> dict[str, Any]:
         prompt_chars = len(system_prompt) + len(user_message)
         total_input_chars += prompt_chars
         logger.info("Prompt size: ~%d chars (system: %d, user: %d)", prompt_chars, len(system_prompt), len(user_message))
+
+        # M1: Prompt size hard cap at 8000 chars
+        MAX_PROMPT_CHARS = 8000
+        if prompt_chars > MAX_PROMPT_CHARS:
+            logger.warning(
+                "Prompt too large (%d > %d), trimming notes for tag '%s'",
+                prompt_chars, MAX_PROMPT_CHARS, tag_name,
+            )
+            # Level 1: reduce to 10 notes + 300 char summaries
+            trimmed_paths = note_paths[:10]
+            system_prompt, user_message = _build_tag_prompt(
+                action, tag_name, trimmed_paths, concept_content,
+                max_summary_chars=300,
+            )
+            prompt_chars = len(system_prompt) + len(user_message)
+            total_input_chars += prompt_chars
+            logger.info(
+                "After trim (10 notes, 300 char summaries): ~%d chars",
+                prompt_chars,
+            )
+            # Update note_paths for downstream use
+            note_paths = trimmed_paths
+
+            # Level 2: still too large? Reduce concept_page to 1000 chars
+            if prompt_chars > MAX_PROMPT_CHARS:
+                logger.warning(
+                    "Still too large (%d > %d), reducing concept page context",
+                    prompt_chars, MAX_PROMPT_CHARS,
+                )
+                system_prompt, user_message = _build_tag_prompt(
+                    action, tag_name, note_paths, concept_content,
+                    max_summary_chars=300, max_concept_chars=1000,
+                )
+                prompt_chars = len(system_prompt) + len(user_message)
+                total_input_chars += prompt_chars
+                logger.info(
+                    "After concept truncation (1000 chars): ~%d chars",
+                    prompt_chars,
+                )
+
+            # Level 3: still too large? Skip this tag
+            if prompt_chars > MAX_PROMPT_CHARS:
+                logger.error(
+                    "Prompt still too large (%d > %d) after all trimming — "
+                    "skipping tag '%s'",
+                    prompt_chars, MAX_PROMPT_CHARS, tag_name,
+                )
+                _append_log_md(
+                    f"[skip] tag/{tag_name} — prompt too large "
+                    f"({prompt_chars} > {MAX_PROMPT_CHARS}) after trimming"
+                )
+                errors += 1
+                continue
 
         # Call DeepSeek LLM
         try:

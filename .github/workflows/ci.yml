@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Syntax check
+        run: python -m compileall pipeline/ collect.py
       - name: Log in to DockerHub
         uses: docker/login-action@v3
         with:
@@ -20,4 +22,6 @@ jobs:
         with:
           context: .
           push: true
-          tags: kona01z/ds004-pipeline:latest
+          tags: |
+            kona01z/ds004-pipeline:latest
+            kona01z/ds004-pipeline:sha-${{ github.sha }}
