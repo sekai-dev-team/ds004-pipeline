@@ -187,6 +187,17 @@ def _extract_summary(content: str, max_chars: int = 500) -> str:
     return content
 
 
+def _extract_title(content: str) -> str:
+    """Extract the article title from the first # heading in markdown.
+
+    Falls back to 'Untitled' if no heading found.
+    """
+    title_match = re.search(r'^#\s+(.+?)(?:\n|$)', content, re.MULTILINE)
+    if title_match:
+        return title_match.group(1).strip()
+    return "Untitled"
+
+
 def _build_search_query(content: str) -> str:
     """Extract a search query from note content, preferring the ## 摘要 section.
 
@@ -353,9 +364,11 @@ def _build_consolidation_prompt(
 
     # v2.1: new note uses summary (max 500 chars instead of 8000)
     new_note_summary = _extract_summary(new_note_content, max_chars=500)
+    new_note_title = _extract_title(new_note_content)
 
     user_lines = [
         f"## New Episodic Note",
+        f"**Title:** {new_note_title}",
         f"**File:** {new_note_path}",
         f"**Date:** {date_str}",
         f"**Timestamp:** {timestamp}",
@@ -376,12 +389,14 @@ def _build_consolidation_prompt(
             score = note.get("vec_score", 0)
             # v2.1: use 摘要 section from each matched note (300 chars)
             note_content = read_vault_file(path)
+            note_title = _extract_title(note_content) if note_content else "Untitled"
             summary = (
                 _extract_summary(note_content, max_chars=300)
                 if note_content
                 else ""
             )
-            user_lines.append(f"### {i}. {path} (score: {score:.3f})")
+            user_lines.append(f"### {i}. {note_title} (score: {score:.3f})")
+            user_lines.append(f"**File:** {path}")
             user_lines.append("```")
             user_lines.append(
                 summary if summary else note.get("snippet", "")[:300]
