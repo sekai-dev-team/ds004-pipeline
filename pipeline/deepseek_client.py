@@ -108,6 +108,29 @@ def complete(
                 if result:
                     logger.info("DeepSeek response: %d chars", len(result))
                     return result
+                # Content blocks exist but are empty — check stop_reason
+                stop_reason = data.get("stop_reason", "")
+                if stop_reason:
+                    logger.warning(
+                        "DeepSeek returned empty content with stop_reason=%r. "
+                        "Full response: %s",
+                        stop_reason,
+                        json.dumps(data, ensure_ascii=False)[:2000],
+                    )
+                    if stop_reason == "max_tokens":
+                        raise DeepSeekError(
+                            f"Response truncated: stop_reason=max_tokens. "
+                            f"Increase max_tokens (currently {max_tokens}) or reduce input size."
+                        )
+                    raise DeepSeekError(
+                        f"Empty content with stop_reason={stop_reason!r}"
+                    )
+                # Empty content with no stop_reason — log and fall through to next checks
+                logger.warning(
+                    "DeepSeek returned empty content blocks with no stop_reason. "
+                    "Full response: %s",
+                    json.dumps(data, ensure_ascii=False)[:2000],
+                )
 
             # Fallback: check for "choices" (OpenAI-compatible response)
             if "choices" in data:
@@ -116,8 +139,33 @@ def complete(
                     logger.info("DeepSeek (OpenAI-format) response: %d chars", len(result))
                     return result
 
-            logger.error("Unexpected DeepSeek response shape: %s", json.dumps(data, ensure_ascii=False)[:500])
-            raise DeepSeekError(f"Unexpected response format")
+            # Fallback: check for standalone "message" field
+            if "message" in data:
+                msg = data["message"]
+                if isinstance(msg, dict):
+                    result = msg.get("content", "")
+                elif isinstance(msg, str):
+                    result = msg
+                else:
+                    result = str(msg)
+                if result:
+                    logger.info("DeepSeek (message field) response: %d chars", len(result))
+                    return result
+
+            # Fallback: check for standalone "text" field
+            if "text" in data and isinstance(data["text"], str) and data["text"].strip():
+                logger.info("DeepSeek (text field) response: %d chars", len(data["text"]))
+                return data["text"]
+
+            # Nothing matched — log full response for debugging
+            logger.error(
+                "Unexpected DeepSeek response shape. "
+                "Full response (first 2000 chars): %s",
+                json.dumps(data, ensure_ascii=False)[:2000],
+            )
+            raise DeepSeekError(
+                f"Unexpected response format; keys present: {list(data.keys())}"
+            )
 
         except requests.exceptions.Timeout:
             last_error = f"Timeout after {REQUEST_TIMEOUT}s"
