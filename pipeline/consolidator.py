@@ -1176,7 +1176,12 @@ def consolidate_all() -> dict[str, Any]:
     wikilinks_injected = _inject_wikilinks_to_notes(new_notes, tag_library)
 
     # Step 6: Cross-concept association edges
-    cross_concept_links = _build_cross_concept_links(updated_tag_names, tag_library)
+    # Phase 2.1: Process ALL concept-bearing tags, not just updated_tag_names
+    all_concept_tags = [
+        name for name, info in tag_library.items()
+        if info.get("concept_page") and info.get("embedding")
+    ]
+    cross_concept_links = _build_cross_concept_links(all_concept_tags, tag_library)
 
     # Step 7: Mark all new notes as processed
     processed, _ = _load_state()
