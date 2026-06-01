@@ -208,8 +208,8 @@ def _find_all_related(note_path: str, content: str, limit: int = 15) -> list[dic
         List of dicts with path, vec_score, snippet, etc., sorted by vec_score desc.
     """
     query = _build_search_query(content)
-    # Search with a higher limit than needed — search() already filters by vec_score > 0.75
-    results = search(query, limit=max(limit * 2, 20), exclude_path=note_path)
+    # Search with a higher limit than needed — search() filters by vec_score threshold
+    results = search(query, limit=max(limit * 2, 20), exclude_path=note_path, threshold=VEC_SCORE_THRESHOLD)
 
     # Filter out subdirectory paths (concepts, insights, digests, etc.)
     related = [

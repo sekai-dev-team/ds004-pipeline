@@ -112,11 +112,11 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def search(query: str, limit: int = 10, exclude_path: str | None = None) -> list[dict[str, Any]]:
+def search(query: str, limit: int = 10, exclude_path: str | None = None, threshold: float = 0.90) -> list[dict[str, Any]]:
     """Search the vault using hybrid (BM25 + vector) search.
 
     Returns list of {path, section_title, snippet, bm25_score, vec_score, combined_score}.
-    Only results with vec_score > 0.75 are returned.
+    Only results with vec_score > threshold (default 0.90) are returned.
     Filters out log.md, index.md, SCHEMA.md, and excluded path.
     """
     result = _call_tool("search", {"query": query, "limit": limit})
@@ -148,7 +148,6 @@ def search(query: str, limit: int = 10, exclude_path: str | None = None) -> list
             results = result
 
     # Filter by vec_score threshold
-    threshold = 0.75
     filtered = [r for r in results if r.get("vec_score", 0) > threshold]
 
     # Filter out non-episodic files (log.md, index.md, SCHEMA.md)
