@@ -235,6 +235,28 @@ def _truncate_context(content: str, max_chars: int = MAX_CONTEXT_CHARS) -> str:
     return content
 
 
+def _strip_metadata_sections(content: str) -> str:
+    """Remove ## 相关概念 and ## 相关文章 sections from concept page content.
+
+    These sections are pipeline-injected metadata (cross-concept links and
+    related article links).  They are useless (and harmful) as LLM context
+    because they consume prompt budget and can cause the LLM to reproduce
+    the sections, leading to duplicate headers (Bug 3 fix).
+
+    Args:
+        content: Raw concept page content, possibly including metadata sections.
+
+    Returns:
+        Content with everything after the first occurrence of either
+        ``## 相关概念`` or ``## 相关文章`` stripped.
+    """
+    for marker in ("## 相关概念", "## 相关文章"):
+        idx = content.find(marker)
+        if idx != -1:
+            content = content[:idx].rstrip()
+    return content
+
+
 # ============================================================================
 #  Tag library management (NEW in v3.0)
 # ============================================================================
@@ -536,8 +558,23 @@ def _inject_concept_frontmatter(
     On updates, preserves the original 'created' date from the existing page.
     Does NOT include '## 相关文章' (v3.0: wikilinks go into episodic notes).
     The '## 相关概念' section is added later by _build_cross_concept_links.
+
+    Bug 1 fix: strips metadata sections from body_content (in case the LLM
+    included ## 相关概念 or ## 相关文章), and avoids duplicating the
+    ``# {title}`` heading when body_content already starts with one.
     """
     created = existing_created if existing_created else date_str
+
+    # ---- Bug 1 / Bug 3: strip pipeline-injected sections from LLM output ----
+    body_content = _strip_metadata_sections(body_content)
+
+    # ---- Bug 1: avoid duplicating the # title heading ----
+    title_heading = f"# {title}"
+    if body_content.lstrip().startswith(title_heading):
+        # LLM already emitted the title heading — do not prepend another
+        body_block = body_content
+    else:
+        body_block = f"# {title}\n\n{body_content}"
 
     return f"""---
 memory_type: semantic
@@ -548,9 +585,7 @@ created: {created}
 last_updated: {date_str}
 ---
 
-# {title}
-
-{body_content}
+{body_block}
 
 ## 相关概念
 
@@ -709,23 +744,103 @@ def _build_cross_concept_links(
                     )
 
         if cross_links:
-            # Find the "## 相关概念" section and append links
-            if "## 相关概念" in source_content:
-                # Append new links after the heading
-                links_str = "\n".join(cross_links) + "\n"
-                # Append at end of the "相关概念" section — insert before next ## or at end
-                updated = source_content.rstrip() + "\n" + links_str
+            links_str = "\n".join(cross_links) + "\n"
+
+            # Find the "## 相关概念" section and insert links within it
+            # (Bug 1 fix: insert BEFORE any subsequent ## heading such as
+            #  ``## 相关文章``, NOT at the end of the file)
+            heading_match = re.search(
+                r'^##\s+相关概念\s*$',
+                source_content,
+                re.MULTILINE,
+            )
+            if heading_match:
+                # Insert links right after the heading line (skip blank lines)
+                insert_pos = heading_match.end()
+                rest = source_content[insert_pos:]
+                blank_match = re.match(r'[ \t]*\n', rest)
+                if blank_match:
+                    insert_pos += blank_match.end()
+                updated = (
+                    source_content[:insert_pos]
+                    + links_str
+                    + source_content[insert_pos:]
+                )
                 write_vault_file(source_concept_page, updated)
                 links_added += len(cross_links)
             else:
-                # Add section at end
-                section = "\n\n## 相关概念\n\n" + "\n".join(cross_links) + "\n"
+                # No "## 相关概念" section exists — add at end of file
+                section = "\n\n## 相关概念\n\n" + links_str
                 updated = source_content.rstrip() + section
                 write_vault_file(source_concept_page, updated)
                 links_added += len(cross_links)
 
     logger.info("Total cross-concept links added: %d", links_added)
     return links_added
+
+
+def _inject_related_articles(
+    concept_path: str,
+    note_paths: list[str],
+) -> None:
+    """Add ``## 相关文章`` section to a concept page (Bug 2 fix).
+
+    Inserts wikilinks pointing back to the episodic source notes that
+    contributed to this concept.  If the section already exists from a
+    previous run, new links are appended without duplicating existing ones.
+
+    Args:
+        concept_path: Relative vault path of the concept page
+                      (e.g. ``concepts/reinforcement-learning.md``).
+        note_paths:   Episodic note paths in this tag group.
+    """
+    content = read_vault_file(concept_path)
+    if not content:
+        logger.warning(
+            "Cannot inject related articles — page not found: %s", concept_path
+        )
+        return
+
+    article_links = [f"- [[{path}]]" for path in sorted(set(note_paths))]
+
+    # Check whether a ``## 相关文章`` section already exists
+    section_match = re.search(
+        r'^##\s+相关文章\s*\n(.*?)(?=\n##\s|\Z)',
+        content,
+        re.MULTILINE | re.DOTALL,
+    )
+
+    if section_match:
+        # Append links that aren't already present
+        existing = section_match.group(1)
+        links_to_add = [l for l in article_links if l not in existing]
+        if not links_to_add:
+            logger.debug("No new related articles to add to %s", concept_path)
+            return
+
+        insert_before = section_match.end(1)
+        updated = (
+            content[:insert_before]
+            + "\n".join(links_to_add)
+            + "\n"
+            + content[insert_before:]
+        )
+        logger.info(
+            "Appended %d new article link(s) to %s",
+            len(links_to_add),
+            concept_path,
+        )
+    else:
+        # Create a brand-new section
+        section_body = "\n".join(article_links)
+        updated = content.rstrip() + f"\n\n## 相关文章\n{section_body}\n"
+        logger.info(
+            "Added ## 相关文章 section (%d links) to %s",
+            len(article_links),
+            concept_path,
+        )
+
+    write_vault_file(concept_path, updated)
 
 
 # ============================================================================
@@ -838,6 +953,61 @@ def _write_report(report: dict[str, Any]) -> None:
     print(json.dumps(report, ensure_ascii=False), flush=True)
 
 
+def _cleanup_duplicate_headers() -> None:
+    """One-time cleanup: deduplicate ``# title`` and ``## 相关概念`` headers.
+
+    Existing concept pages may have accumulated duplicate headers from
+    pre-fix consolidation runs.  This function scans every page under
+    ``concepts/`` and cleans them up.  It is idempotent and safe to
+    call on every run (it short-circuits when no duplicates are found).
+    """
+    concepts_dir = Path(VAULT_PATH) / "concepts"
+    if not concepts_dir.is_dir():
+        return
+
+    cleaned = 0
+    for entry in sorted(concepts_dir.iterdir()):
+        if not entry.suffix == ".md":
+            continue
+        try:
+            content = entry.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+
+        original = content
+
+        # --- Deduplicate # title (keep only the first occurrence) ---
+        lines = content.split("\n")
+        seen_title = False
+        new_lines: list[str] = []
+        for line in lines:
+            if line.startswith("# ") and not line.startswith("## "):
+                if not seen_title:
+                    seen_title = True
+                    new_lines.append(line)
+                # else: skip duplicate title
+            else:
+                new_lines.append(line)
+        content = "\n".join(new_lines)
+
+        # --- Deduplicate ## 相关概念 headings (keep only the first) ---
+        heading_pat = re.compile(r"^##\s+相关概念\s*$", re.MULTILINE)
+        headings = list(heading_pat.finditer(content))
+        if len(headings) > 1:
+            for h in reversed(headings[1:]):
+                content = content[: h.start()] + content[h.end() :]
+
+        if content != original:
+            entry.write_text(content, encoding="utf-8")
+            cleaned += 1
+            logger.info("Cleaned duplicate headers in concepts/%s", entry.name)
+
+    if cleaned:
+        logger.info("Deduplicated headers in %d concept page(s)", cleaned)
+    else:
+        logger.debug("No duplicate headers found in concept pages")
+
+
 # ============================================================================
 #  Main consolidation loop (REWRITTEN for v3.0 SYNAPSE)
 # ============================================================================
@@ -859,6 +1029,9 @@ def consolidate_all() -> dict[str, Any]:
         Report dict with summary, token_usage, per_concept, memory sections.
         Flat keys (new_notes, consolidated, etc.) kept for backward compat.
     """
+    # Bug 1 one-time cleanup: deduplicate headers in existing concept pages
+    _cleanup_duplicate_headers()
+
     # Step 1: Find new episodic notes
     new_notes = _find_new_episodic_notes()
 
@@ -971,6 +1144,8 @@ def consolidate_all() -> dict[str, Any]:
         if concept_page:
             # UPDATE: existing concept page always gets updated
             concept_content = read_vault_file(concept_page)
+            # Bug 3: strip metadata sections before sending to LLM
+            concept_content = _strip_metadata_sections(concept_content)
             consolidation_tasks.append(("update", tag_name, note_paths, concept_content))
             updated_tag_names.append(tag_name)
         elif article_count >= CONCEPT_CREATE_THRESHOLD:
@@ -1122,6 +1297,9 @@ def consolidate_all() -> dict[str, Any]:
         else:
             logger.info("Updating concept page: %s", concept_path)
             write_vault_file(concept_path, full_page)
+
+        # Bug 2: add / update ## 相关文章 section linking to episodic source notes
+        _inject_related_articles(concept_path, note_paths)
 
         # Update tag library: increment article_count, update last_seen
         if tag_name in tag_library:
