@@ -121,10 +121,16 @@ def _is_episodic_note(content: str) -> bool:
 def _find_new_episodic_notes() -> list[str]:
     """Scan vault root for new episodic notes not yet processed.
 
+    v3.0 Phase 2: Notes in processed_notes that lack a '## 相关概念' section
+    (meaning wikilinks were never injected) are treated as "new" for
+    consolidation purposes, avoiding the need for --reset-state.
+
     Returns list of relative file paths.
     """
     processed, _ = _load_state()
     new_notes: list[str] = []
+    truly_new_count = 0
+    reprocess_count = 0
 
     try:
         vault_root = Path(VAULT_PATH)
@@ -144,22 +150,35 @@ def _find_new_episodic_notes() -> list[str]:
             if any(skip in rel_path.lower() for skip in SKIP_DIRS):
                 continue
 
-            # Skip already processed
-            if rel_path in processed:
-                continue
-
-            # Check if it's an episodic note
+            # Read content for checks
             try:
                 content = entry.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
 
+            # Skip already processed — but re-process if no wikilinks section
+            if rel_path in processed:
+                if "## 相关概念" not in content:
+                    logger.info("Re-processing (no wikilinks): %s", rel_path)
+                    reprocess_count += 1
+                else:
+                    continue
+
             if _is_episodic_note(content):
                 new_notes.append(rel_path)
-                logger.info("Found new episodic note: %s", rel_path)
+                if rel_path not in processed:
+                    truly_new_count += 1
+                    logger.info("Found new episodic note: %s", rel_path)
 
     except (OSError, FileNotFoundError) as exc:
         logger.error("Failed to scan vault: %s", exc)
+
+    if new_notes:
+        logger.info(
+            "Found %d new + %d re-processable notes",
+            truly_new_count,
+            reprocess_count,
+        )
 
     return new_notes
 
@@ -889,6 +908,49 @@ def consolidate_all() -> dict[str, Any]:
 
     # Step 3: Read tag library and decide actions
     tag_library = read_tag_library()
+
+    # v3.0 Phase 2: Auto-regenerate empty tag embeddings before cross-concept linking
+    if tag_library:
+        regenerated = 0
+        skipped_no_page = 0
+        for tag_name, tag_info in tag_library.items():
+            embedding = tag_info.get("embedding")
+            concept_page = tag_info.get("concept_page")
+
+            # Skip if embedding is already a non-empty list
+            if embedding and isinstance(embedding, list) and len(embedding) > 0:
+                continue
+
+            if not concept_page:
+                logger.info("Skipping tag '%s': no concept_page", tag_name)
+                skipped_no_page += 1
+                continue
+
+            try:
+                new_embedding = embed(tag_name)
+                if new_embedding is not None:
+                    # Persist to tag .md file
+                    update_tag_note(tag_name, {"embedding": new_embedding})
+                    # Update in-memory cache
+                    tag_info["embedding"] = new_embedding
+                    regenerated += 1
+                    logger.info("Regenerated embedding for tag '%s'", tag_name)
+                else:
+                    logger.warning(
+                        "Failed to generate embedding for tag '%s'", tag_name
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Error generating embedding for tag '%s': %s", tag_name, exc
+                )
+
+        logger.info(
+            "Regenerated %d/%d tag embeddings (skipped %d: no concept_page)",
+            regenerated,
+            len(tag_library),
+            skipped_no_page,
+        )
+
     consolidation_tasks: list[tuple[str, str, list[str], str | None]] = []
     updated_tag_names: list[str] = []
     skipped_tags: list[str] = []
