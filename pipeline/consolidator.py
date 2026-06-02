@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 # ---- Thresholds & constants ----
 
 CONCEPT_CREATE_THRESHOLD = 2  # θ=2: minimum article_count to create a concept page
-CROSS_CONCEPT_SIMILARITY_THRESHOLD = 0.70  # embedding similarity for cross-links
+CROSS_CONCEPT_SIMILARITY_THRESHOLD = 0.91  # embedding similarity for cross-links
 MAX_QUERY_CHARS = 2000
 MAX_CONTEXT_CHARS = 1000
 MAX_NOTES_PER_RUN = 50
