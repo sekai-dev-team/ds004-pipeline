@@ -782,18 +782,23 @@ def _build_cross_concept_links(
 def _inject_related_articles(
     concept_path: str,
     note_paths: list[str],
+    preserved_links: list[str] | None = None,
 ) -> None:
-    """Add ``## 相关文章`` section to a concept page (Bug 2 fix).
+    """Add ``## 相关文章`` section to a concept page (Bug 2 + Bug 4 fix).
 
     Inserts wikilinks pointing back to the episodic source notes that
-    contributed to this concept.  If the section already exists from a
-    previous run, new links are appended without duplicating existing ones.
+    contributed to this concept.  Merges with ``preserved_links`` from
+    the pre-overwrite version so historical article links survive UPDATEs.
 
     Args:
-        concept_path: Relative vault path of the concept page
-                      (e.g. ``concepts/reinforcement-learning.md``).
-        note_paths:   Episodic note paths in this tag group.
+        concept_path:    Relative vault path of the concept page.
+        note_paths:      Episodic note paths in THIS tag group (new).
+        preserved_links: Wikilinks from the OLD ``## 相关文章`` section,
+                         saved before the concept page was overwritten.
     """
+    if preserved_links is None:
+        preserved_links = []
+
     content = read_vault_file(concept_path)
     if not content:
         logger.warning(
@@ -802,6 +807,14 @@ def _inject_related_articles(
         return
 
     article_links = [f"- [[{path}]]" for path in sorted(set(note_paths))]
+    # Merge: preserved links + new links, deduplicated, order-stable
+    all_links_raw = preserved_links + article_links
+    seen: set[str] = set()
+    all_links: list[str] = []
+    for link in all_links_raw:
+        if link not in seen:
+            seen.add(link)
+            all_links.append(link)
 
     # Check whether a ``## 相关文章`` section already exists
     section_match = re.search(
@@ -813,7 +826,7 @@ def _inject_related_articles(
     if section_match:
         # Append links that aren't already present
         existing = section_match.group(1)
-        links_to_add = [l for l in article_links if l not in existing]
+        links_to_add = [l for l in all_links if l not in existing]
         if not links_to_add:
             logger.debug("No new related articles to add to %s", concept_path)
             return
@@ -831,11 +844,13 @@ def _inject_related_articles(
             concept_path,
         )
     else:
-        # Create a brand-new section
-        section_body = "\n".join(article_links)
+        # Create a brand-new section with ALL links (preserved + new)
+        section_body = "\n".join(all_links)
         updated = content.rstrip() + f"\n\n## 相关文章\n{section_body}\n"
         logger.info(
-            "Added ## 相关文章 section (%d links) to %s",
+            "Added ## 相关文章 section (%d links: %d preserved + %d new) to %s",
+            len(all_links),
+            len(preserved_links),
             len(article_links),
             concept_path,
         )
@@ -1124,7 +1139,7 @@ def consolidate_all() -> dict[str, Any]:
             skipped_no_page,
         )
 
-    consolidation_tasks: list[tuple[str, str, list[str], str | None]] = []
+    consolidation_tasks: list[tuple[str, str, list[str], str | None, list[str]]] = []
     updated_tag_names: list[str] = []
     skipped_tags: list[str] = []
 
@@ -1144,13 +1159,29 @@ def consolidate_all() -> dict[str, Any]:
         if concept_page:
             # UPDATE: existing concept page always gets updated
             concept_content = read_vault_file(concept_page)
+            # Bug 4: extract old ## 相关文章 links BEFORE stripping, so
+            # _inject_related_articles can merge instead of replace
+            old_article_section = re.search(
+                r'^##\s+相关文章\s*\n(.*?)(?=\n##\s|\Z)',
+                concept_content,
+                re.MULTILINE | re.DOTALL,
+            )
+            old_article_links: list[str] = []
+            if old_article_section:
+                old_article_links = [
+                    line.strip()
+                    for line in old_article_section.group(1).split("\n")
+                    if line.strip().startswith("- [[")
+                ]
             # Bug 3: strip metadata sections before sending to LLM
             concept_content = _strip_metadata_sections(concept_content)
-            consolidation_tasks.append(("update", tag_name, note_paths, concept_content))
+            consolidation_tasks.append(
+                ("update", tag_name, note_paths, concept_content, old_article_links)
+            )
             updated_tag_names.append(tag_name)
         elif article_count >= CONCEPT_CREATE_THRESHOLD:
             # CREATE: enough articles for a new concept page
-            consolidation_tasks.append(("create", tag_name, note_paths, None))
+            consolidation_tasks.append(("create", tag_name, note_paths, None, []))
             updated_tag_names.append(tag_name)
         else:
             # SKIP: not enough articles yet
@@ -1177,7 +1208,7 @@ def consolidate_all() -> dict[str, Any]:
 
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    for action, tag_name, note_paths, concept_content in consolidation_tasks:
+    for action, tag_name, note_paths, concept_content, old_links in consolidation_tasks:
         logger.info("=== Consolidating tag: %s (action: %s, notes: %d) ===", tag_name, action, len(note_paths))
 
         # Build prompt
@@ -1298,6 +1329,9 @@ def consolidate_all() -> dict[str, Any]:
             logger.info("Updating concept page: %s", concept_path)
             write_vault_file(concept_path, full_page)
 
+        # Bug 2: add / update ## 相关文章 section linking to episodic source notes
+        _inject_related_articles(concept_path, note_paths, old_links)
+
         # Update tag library: increment article_count, update last_seen
         if tag_name in tag_library:
             new_count = tag_library[tag_name].get("article_count", 0) + len(note_paths)
@@ -1341,7 +1375,6 @@ def consolidate_all() -> dict[str, Any]:
         per_concept[tag_name] = {
             "action": action,
             "related_notes": len(note_paths),
-            "note_paths": note_paths,
         }
 
         # Memory cleanup
@@ -1359,13 +1392,7 @@ def consolidate_all() -> dict[str, Any]:
     ]
     cross_concept_links = _build_cross_concept_links(all_concept_tags, tag_library)
 
-    # Step 7: Inject ## 相关文章 into all consolidated concept pages
-    # (moved after cross-concept links so ## 相关概念 appears first)
-    for tag_name, data in per_concept.items():
-        concept_path = f"concepts/{tag_name}.md"
-        _inject_related_articles(concept_path, data["note_paths"])
-
-    # Step 8: Mark all new notes as processed
+    # Step 7: Mark all new notes as processed
     processed, _ = _load_state()
     for note_path in new_notes:
         processed.add(note_path)
