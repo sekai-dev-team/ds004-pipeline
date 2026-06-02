@@ -1298,9 +1298,6 @@ def consolidate_all() -> dict[str, Any]:
             logger.info("Updating concept page: %s", concept_path)
             write_vault_file(concept_path, full_page)
 
-        # Bug 2: add / update ## 相关文章 section linking to episodic source notes
-        _inject_related_articles(concept_path, note_paths)
-
         # Update tag library: increment article_count, update last_seen
         if tag_name in tag_library:
             new_count = tag_library[tag_name].get("article_count", 0) + len(note_paths)
@@ -1344,6 +1341,7 @@ def consolidate_all() -> dict[str, Any]:
         per_concept[tag_name] = {
             "action": action,
             "related_notes": len(note_paths),
+            "note_paths": note_paths,
         }
 
         # Memory cleanup
@@ -1361,7 +1359,13 @@ def consolidate_all() -> dict[str, Any]:
     ]
     cross_concept_links = _build_cross_concept_links(all_concept_tags, tag_library)
 
-    # Step 7: Mark all new notes as processed
+    # Step 7: Inject ## 相关文章 into all consolidated concept pages
+    # (moved after cross-concept links so ## 相关概念 appears first)
+    for tag_name, data in per_concept.items():
+        concept_path = f"concepts/{tag_name}.md"
+        _inject_related_articles(concept_path, data["note_paths"])
+
+    # Step 8: Mark all new notes as processed
     processed, _ = _load_state()
     for note_path in new_notes:
         processed.add(note_path)
