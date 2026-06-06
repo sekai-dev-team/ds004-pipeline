@@ -1297,6 +1297,10 @@ def consolidate_all() -> dict[str, Any]:
         title = parsed.get("title", tag_name.replace("-", " ").title())
         body_content = parsed.get("body_content", "")
         index_update = parsed.get("index_update", "")
+        if isinstance(index_update, bool):
+            index_update = ""
+        elif not isinstance(index_update, str):
+            index_update = str(index_update)
         log_entry = parsed.get("log_entry", "")
 
         if not body_content or not body_content.strip():
